@@ -1,0 +1,14 @@
+#!/bin/bash
+set -e
+
+echo ""
+echo "Claude Usage Monitor installed to /usr/local/bin/claude-usage-monitor"
+echo ""
+echo "Autostart is ENABLED by default (launches on login)."
+echo ""
+echo "To disable autostart:"
+echo "  sudo rm /etc/xdg/autostart/claude-usage-monitor.desktop"
+echo ""
+echo "To re-enable autostart:"
+echo "  sudo cp /usr/share/applications/claude-usage-monitor.desktop /etc/xdg/autostart/"
+echo ""

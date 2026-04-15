@@ -1,0 +1,5 @@
+#!/bin/bash
+set -e
+
+# Kill running instances
+pkill -f claude-usage-monitor 2>/dev/null || true

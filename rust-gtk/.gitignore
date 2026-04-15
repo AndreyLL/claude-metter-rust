@@ -1,0 +1,3 @@
+target/
+*.deb
+pkg/usr/local/bin/claude-usage-monitor

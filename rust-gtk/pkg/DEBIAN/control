@@ -1,0 +1,12 @@
+Package: claude-usage-monitor
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: libgtk-3-0, libcairo2, libpango-1.0-0
+Maintainer: Claude Usage Monitor <noreply@example.com>
+Description: Claude Code API usage monitor for GNOME panel
+ Shows Claude Code subscription usage limits (5-hour and 7-day windows)
+ as color-coded progress bars on the GNOME top panel.
+ Features burn-rate coloring, time-elapsed indicator, dragging, and resizing.
+Installed-Size: 2528
