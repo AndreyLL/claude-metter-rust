@@ -8,12 +8,13 @@ use gdk::{EventMask, ScrollDirection};
 use glib::ControlFlow;
 use gtk::prelude::*;
 use gtk::{EventBox, WindowType};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const CREDENTIALS_PATH: &str = ".claude/.credentials.json";
 const CONFIG_PATH: &str = ".config/claude-usage-monitor/config.json";
+const HISTORY_PATH: &str = ".config/claude-usage-monitor/history.json";
 const API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const DEFAULT_POLL_MINUTES: u32 = 5;
 const MIN_POLL_MINUTES: u32 = 1;
@@ -33,9 +34,13 @@ const COLOR_RED: (f64, f64, f64) = (0.957, 0.263, 0.212);
 const COLOR_BLUE_TIME: (f64, f64, f64) = (0.26, 0.52, 0.96);
 const COLOR_BG_TRACK: (f64, f64, f64, f64) = (0.3, 0.3, 0.3, 0.5);
 const COLOR_BG_WINDOW: (f64, f64, f64, f64) = (0.15, 0.15, 0.15, 0.85);
+const COLOR_CURVE: (f64, f64, f64) = (1.0, 0.85, 0.0);
 
 const WINDOW_5H_SEC: f64 = 5.0 * 3600.0;
 const WINDOW_7D_SEC: f64 = 7.0 * 24.0 * 3600.0;
+
+const MIN_RATE_SCALE_5H: f64 = 2.0;  // %/hour autolevel floor
+const MIN_RATE_SCALE_7D: f64 = 0.2;
 
 // ── Data types ─────────────────────────────────────────────────────────────
 
@@ -110,6 +115,90 @@ fn save_config(cfg: &Config) {
     }
 }
 
+// ── Rate history ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+struct RateSample {
+    t: DateTime<Utc>,
+    util: f64,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+struct RateBuffer {
+    resets_at: String,
+    samples: Vec<RateSample>,
+}
+
+#[derive(Deserialize, Serialize, Default, Clone, Debug)]
+struct History {
+    rate_5h: Option<RateBuffer>,
+    rate_7d: Option<RateBuffer>,
+}
+
+fn history_path() -> std::path::PathBuf {
+    dirs_or_home().join(HISTORY_PATH)
+}
+
+fn buffer_is_stale(b: &RateBuffer) -> bool {
+    match DateTime::<FixedOffset>::parse_from_rfc3339(&b.resets_at) {
+        Ok(r) => r.with_timezone(&Utc) <= Utc::now(),
+        Err(_) => true,
+    }
+}
+
+fn load_history() -> History {
+    let Ok(content) = std::fs::read_to_string(history_path()) else {
+        return History::default();
+    };
+    let mut h: History = serde_json::from_str(&content).unwrap_or_default();
+    if h.rate_5h.as_ref().map_or(false, buffer_is_stale) {
+        h.rate_5h = None;
+    }
+    if h.rate_7d.as_ref().map_or(false, buffer_is_stale) {
+        h.rate_7d = None;
+    }
+    h
+}
+
+fn save_history(h: &History) {
+    let path = history_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(h) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// API returns `resets_at` with sub-second jitter between calls even when the
+/// logical window hasn't rolled over. Treat two timestamps as the same window
+/// when they fall within ±2 minutes.
+fn same_window(a: &str, b: &str) -> bool {
+    let Ok(ta) = DateTime::<FixedOffset>::parse_from_rfc3339(a) else { return false };
+    let Ok(tb) = DateTime::<FixedOffset>::parse_from_rfc3339(b) else { return false };
+    (ta.timestamp() - tb.timestamp()).abs() <= 120
+}
+
+fn update_rate_buffer(
+    buffer: &mut Option<RateBuffer>,
+    util: Option<f64>,
+    resets_at: Option<&str>,
+) {
+    let (Some(u), Some(r)) = (util, resets_at) else { return };
+    let now = Utc::now();
+    match buffer {
+        Some(b) if same_window(&b.resets_at, r) => {
+            b.samples.push(RateSample { t: now, util: u });
+        }
+        _ => {
+            *buffer = Some(RateBuffer {
+                resets_at: r.to_string(),
+                samples: vec![RateSample { t: now, util: u }],
+            });
+        }
+    }
+}
+
 struct State {
     usage: UsageData,
     last_good: Option<UsageData>,
@@ -118,6 +207,7 @@ struct State {
     popup: Option<gtk::Window>,
     config: Config,
     timer_source: Option<glib::SourceId>,
+    history: History,
 }
 
 impl State {
@@ -130,7 +220,22 @@ impl State {
             popup: None,
             config: load_config(),
             timer_source: None,
+            history: load_history(),
         }
+    }
+
+    fn record_usage(&mut self, u: &UsageData) {
+        update_rate_buffer(
+            &mut self.history.rate_5h,
+            u.five_hour,
+            u.five_hour_resets.as_deref(),
+        );
+        update_rate_buffer(
+            &mut self.history.rate_7d,
+            u.seven_day,
+            u.seven_day_resets.as_deref(),
+        );
+        save_history(&self.history);
     }
 }
 
@@ -284,6 +389,105 @@ fn draw_rounded_rect(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64
     cr.close_path();
 }
 
+fn draw_rate_curve(
+    cr: &cairo::Context,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    buffer: &RateBuffer,
+    window_sec: f64,
+    min_scale: f64,
+    scale: f64,
+) {
+    let Ok(reset) = DateTime::<FixedOffset>::parse_from_rfc3339(&buffer.resets_at) else {
+        return;
+    };
+    let reset_utc = reset.with_timezone(&Utc);
+    let window_start = reset_utc - chrono::Duration::seconds(window_sec as i64);
+
+    let s = &buffer.samples;
+    if s.len() < 2 {
+        return;
+    }
+
+    // (normalized_t in [0,1], rate %/hour)
+    let mut points: Vec<(f64, f64)> = Vec::with_capacity(s.len() - 1);
+    for i in 1..s.len() {
+        let dt_sec = (s[i].t - s[i - 1].t).num_milliseconds() as f64 / 1000.0;
+        if dt_sec <= 0.0 {
+            continue;
+        }
+        let du = (s[i].util - s[i - 1].util).max(0.0);
+        let rate = du / (dt_sec / 3600.0);
+        let mid = s[i - 1].t + (s[i].t - s[i - 1].t) / 2;
+        let norm = (mid - window_start).num_milliseconds() as f64 / (window_sec * 1000.0);
+        if !(0.0..=1.0).contains(&norm) {
+            continue;
+        }
+        points.push((norm, rate));
+    }
+    if points.len() < 2 {
+        return;
+    }
+
+    let max_rate = points.iter().map(|p| p.1).fold(min_scale, f64::max);
+
+    // Decimate if we have too many points per pixel
+    let target = ((2.0 * w).max(16.0)) as usize;
+    let step = (points.len() / target).max(1);
+    let drawn: Vec<(f64, f64)> = if step > 1 {
+        points.iter().step_by(step).copied().collect()
+    } else {
+        points
+    };
+    if drawn.len() < 2 {
+        return;
+    }
+
+    // Screen coords
+    let screen: Vec<(f64, f64)> = drawn
+        .iter()
+        .map(|(t, r)| {
+            let sx = x + t * w;
+            let sy = (y + h - (r / max_rate) * h).clamp(y, y + h);
+            (sx, sy)
+        })
+        .collect();
+
+    // Catmull-Rom → cubic Bezier path
+    cr.new_path();
+    cr.move_to(screen[0].0, screen[0].1);
+    for i in 0..screen.len() - 1 {
+        let p0 = if i == 0 { screen[0] } else { screen[i - 1] };
+        let p1 = screen[i];
+        let p2 = screen[i + 1];
+        let p3 = if i + 2 < screen.len() {
+            screen[i + 2]
+        } else {
+            screen[i + 1]
+        };
+        let c1x = p1.0 + (p2.0 - p0.0) / 6.0;
+        let c1y = p1.1 + (p2.1 - p0.1) / 6.0;
+        let c2x = p2.0 - (p3.0 - p1.0) / 6.0;
+        let c2y = p2.1 - (p3.1 - p1.1) / 6.0;
+        cr.curve_to(c1x, c1y, c2x, c2y, p2.0, p2.1);
+    }
+
+    cr.set_line_cap(cairo::LineCap::Round);
+    cr.set_line_join(cairo::LineJoin::Round);
+
+    // Dark halo
+    cr.set_line_width((2.5 * scale).max(1.5));
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.6);
+    let _ = cr.stroke_preserve();
+
+    // Yellow line
+    cr.set_line_width((1.5 * scale).max(1.0));
+    cr.set_source_rgba(COLOR_CURVE.0, COLOR_CURVE.1, COLOR_CURVE.2, 0.95);
+    let _ = cr.stroke();
+}
+
 fn draw_bar(
     cr: &cairo::Context,
     x: f64,
@@ -295,6 +499,9 @@ fn draw_bar(
     time_pct: f64,
     font_size: f64,
     scale: f64,
+    rate_buffer: Option<&RateBuffer>,
+    window_sec: f64,
+    min_rate_scale: f64,
 ) {
     // Track background
     draw_rounded_rect(cr, x, y, w, h, 2.0);
@@ -319,6 +526,11 @@ fn draw_bar(
         draw_rounded_rect(cr, x, time_y, time_fill_w, time_bar_h, 2.0);
         cr.set_source_rgba(COLOR_BLUE_TIME.0, COLOR_BLUE_TIME.1, COLOR_BLUE_TIME.2, 0.8);
         let _ = cr.fill();
+    }
+
+    // Burn-rate curve — yellow, over fill/time-bar, under text
+    if let Some(buf) = rate_buffer {
+        draw_rate_curve(cr, x, y, w, h, buf, window_sec, min_rate_scale, scale);
     }
 
     // Text shadow
@@ -489,6 +701,7 @@ fn start_timer(state: &Rc<RefCell<State>>, da: &gtk::DrawingArea) {
                 s.usage = new_usage;
             }
         } else {
+            s.record_usage(&new_usage);
             s.last_good = Some(new_usage.clone());
             s.usage = new_usage;
         }
@@ -594,9 +807,11 @@ fn main() {
                 .unwrap_or(0.0);
 
             draw_bar(cr, pad_h, pad_v, bar_w, bar_h, five_pct,
-                     &format!("5h:{:.0}%", five_pct), five_time, font_size, s.scale);
+                     &format!("5h:{:.0}%", five_pct), five_time, font_size, s.scale,
+                     s.history.rate_5h.as_ref(), WINDOW_5H_SEC, MIN_RATE_SCALE_5H);
             draw_bar(cr, pad_h + bar_w + spacing, pad_v, bar_w, bar_h, seven_pct,
-                     &format!("7d:{:.0}%", seven_pct), seven_time, font_size, s.scale);
+                     &format!("7d:{:.0}%", seven_pct), seven_time, font_size, s.scale,
+                     s.history.rate_7d.as_ref(), WINDOW_7D_SEC, MIN_RATE_SCALE_7D);
 
             // Stale indicator — red dot in top-right corner
             if s.usage.error.as_deref() == Some("stale") {
@@ -652,6 +867,7 @@ fn main() {
                                         s.usage = new_usage;
                                     }
                                 } else {
+                                    s.record_usage(&new_usage);
                                     s.last_good = Some(new_usage.clone());
                                     s.usage = new_usage;
                                 }
@@ -697,6 +913,7 @@ fn main() {
                                                 s.usage = new_usage;
                                             }
                                         } else {
+                                            s.record_usage(&new_usage);
                                             s.last_good = Some(new_usage.clone());
                                             s.usage = new_usage;
                                         }
@@ -803,6 +1020,7 @@ fn main() {
         let mut s = state.borrow_mut();
         let new_usage = fetch_usage();
         if new_usage.error.is_none() {
+            s.record_usage(&new_usage);
             s.last_good = Some(new_usage.clone());
         }
         s.usage = new_usage;

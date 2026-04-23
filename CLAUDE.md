@@ -8,9 +8,10 @@ Shows two progress bars with real-time Claude Code subscription usage:
 - **5h bar** — 5-hour rolling window utilization (current session)
 - **7d bar** — 7-day weekly limit utilization
 
-Each bar has two layers:
+Each bar has three layers:
 - **Main bar** (colored) — usage percentage (0–100%)
 - **Blue bar** (7px, bottom) — time elapsed in the window
+- **Yellow curve** — burn rate (%/hour) over time within the window, auto-leveled per bar. X axis = time in the window (synced with the blue bar), Y axis = rate with per-bar min floor (2 %/h for 5h, 0.2 %/h for 7d). Rate history persists across restarts in `~/.config/claude-usage-monitor/history.json`; resets when the window rolls over.
 
 ### Burn-rate coloring
 
