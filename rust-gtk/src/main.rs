@@ -421,10 +421,13 @@ fn draw_rate_curve(
         let du = (s[i].util - s[i - 1].util).max(0.0);
         let rate = du / (dt_sec / 3600.0);
         let mid = s[i - 1].t + (s[i].t - s[i - 1].t) / 2;
-        let norm = (mid - window_start).num_milliseconds() as f64 / (window_sec * 1000.0);
-        if !(0.0..=1.0).contains(&norm) {
-            continue;
-        }
+        let norm_raw =
+            (mid - window_start).num_milliseconds() as f64 / (window_sec * 1000.0);
+        // Clamp rather than filter — near rollover, slight clock skew between the
+        // API's `resets_at` and our `now` can push fresh samples just outside
+        // [0,1], and dropping them creates an empty curve on the very frame
+        // where the user most wants to see the update.
+        let norm = norm_raw.clamp(0.0, 1.0);
         points.push((norm, rate));
     }
     if points.len() < 2 {
@@ -433,11 +436,18 @@ fn draw_rate_curve(
 
     let max_rate = points.iter().map(|p| p.1).fold(min_scale, f64::max);
 
-    // Decimate if we have too many points per pixel
+    // Decimate if we have too many points per pixel; always keep the last point
+    // (freshest data — the tail the user most wants to see).
     let target = ((2.0 * w).max(16.0)) as usize;
     let step = (points.len() / target).max(1);
     let drawn: Vec<(f64, f64)> = if step > 1 {
-        points.iter().step_by(step).copied().collect()
+        let mut d: Vec<(f64, f64)> = points.iter().step_by(step).copied().collect();
+        if let Some(&last) = points.last() {
+            if d.last() != Some(&last) {
+                d.push(last);
+            }
+        }
+        d
     } else {
         points
     };
@@ -483,7 +493,7 @@ fn draw_rate_curve(
     let _ = cr.stroke_preserve();
 
     // Yellow line
-    cr.set_line_width((1.5 * scale).max(1.0));
+    cr.set_line_width((0.75 * scale).max(0.5));
     cr.set_source_rgba(COLOR_CURVE.0, COLOR_CURVE.1, COLOR_CURVE.2, 0.95);
     let _ = cr.stroke();
 }
