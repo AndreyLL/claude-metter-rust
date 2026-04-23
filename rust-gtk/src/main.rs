@@ -13,8 +13,11 @@ use serde::Deserialize;
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const CREDENTIALS_PATH: &str = ".claude/.credentials.json";
+const CONFIG_PATH: &str = ".config/claude-usage-monitor/config.json";
 const API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const POLL_INTERVAL_SEC: u32 = 120;
+const DEFAULT_POLL_MINUTES: u32 = 5;
+const MIN_POLL_MINUTES: u32 = 1;
+const MAX_POLL_MINUTES: u32 = 60;
 const REQUEST_TIMEOUT_SEC: u64 = 10;
 
 const BAR_WIDTH: f64 = 90.0;
@@ -75,13 +78,46 @@ struct UsageData {
     error: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Deserialize, serde::Serialize, Clone, Debug)]
+struct Config {
+    poll_minutes: u32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self { poll_minutes: DEFAULT_POLL_MINUTES }
+    }
+}
+
+fn config_path() -> std::path::PathBuf {
+    dirs_or_home().join(CONFIG_PATH)
+}
+
+fn load_config() -> Config {
+    let Ok(content) = std::fs::read_to_string(config_path()) else {
+        return Config::default();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn save_config(cfg: &Config) {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(cfg) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 struct State {
     usage: UsageData,
     last_good: Option<UsageData>,
     scale: f64,
     drag_start: Option<(f64, f64)>,
     popup: Option<gtk::Window>,
+    config: Config,
+    timer_source: Option<glib::SourceId>,
 }
 
 impl State {
@@ -92,6 +128,8 @@ impl State {
             scale: 1.0,
             drag_start: None,
             popup: None,
+            config: load_config(),
+            timer_source: None,
         }
     }
 }
@@ -306,7 +344,9 @@ fn create_popup(
     parent_x: i32,
     parent_y: i32,
     parent_h: i32,
+    poll_minutes: u32,
     on_refresh: impl Fn() + 'static,
+    on_interval_change: impl Fn(i32) + 'static,
 ) -> gtk::Window {
     let popup = gtk::Window::new(WindowType::Popup);
     popup.set_decorated(false);
@@ -362,14 +402,45 @@ fn create_popup(
     }
 
     let refresh_btn = gtk::Button::with_label("Refresh now");
-    let popup_weak = {
-        // We'll connect destroy after showing
-        refresh_btn.connect_clicked(move |_| {
-            on_refresh();
-        });
-        refresh_btn
-    };
-    vbox.pack_start(&popup_weak, false, false, 4);
+    refresh_btn.connect_clicked(move |_| {
+        on_refresh();
+    });
+    vbox.pack_start(&refresh_btn, false, false, 4);
+
+    // Refresh interval controls
+    let interval_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    interval_row.set_halign(gtk::Align::Center);
+    let interval_label = gtk::Label::new(None);
+    interval_label.set_markup(&format!(
+        "<span foreground='white' font='Sans 9'>Refresh every {} min</span>",
+        poll_minutes
+    ));
+    let minus_btn = gtk::Button::with_label("−");
+    let plus_btn = gtk::Button::with_label("+");
+    minus_btn.set_size_request(32, -1);
+    plus_btn.set_size_request(32, -1);
+
+    let on_change = Rc::new(on_interval_change);
+    {
+        let on_change = on_change.clone();
+        minus_btn.connect_clicked(move |_| on_change(-1));
+    }
+    {
+        let on_change = on_change.clone();
+        plus_btn.connect_clicked(move |_| on_change(1));
+    }
+
+    interval_row.pack_start(&minus_btn, false, false, 0);
+    interval_row.pack_start(&interval_label, false, false, 6);
+    interval_row.pack_start(&plus_btn, false, false, 0);
+    vbox.pack_start(&interval_row, false, false, 2);
+
+    // Quit button
+    let quit_btn = gtk::Button::with_label("Quit");
+    quit_btn.connect_clicked(|_| {
+        gtk::main_quit();
+    });
+    vbox.pack_start(&quit_btn, false, false, 2);
 
     // Hint
     let hint = gtk::Label::new(None);
@@ -398,6 +469,34 @@ fn calc_size(scale: f64) -> (f64, f64, f64, f64, f64, f64, f64) {
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────
+
+fn start_timer(state: &Rc<RefCell<State>>, da: &gtk::DrawingArea) {
+    // Cancel existing timer if any
+    if let Some(src) = state.borrow_mut().timer_source.take() {
+        src.remove();
+    }
+    let interval_sec = state.borrow().config.poll_minutes * 60;
+    let st = state.clone();
+    let da_clone = da.clone();
+    let source = glib::timeout_add_seconds_local(interval_sec, move || {
+        let new_usage = fetch_usage();
+        let mut s = st.borrow_mut();
+        if new_usage.error.is_some() {
+            if let Some(ref good) = s.last_good {
+                s.usage = good.clone();
+                s.usage.error = Some("stale".into());
+            } else {
+                s.usage = new_usage;
+            }
+        } else {
+            s.last_good = Some(new_usage.clone());
+            s.usage = new_usage;
+        }
+        da_clone.queue_draw();
+        ControlFlow::Continue
+    });
+    state.borrow_mut().timer_source = Some(source);
+}
 
 fn main() {
     gtk::init().expect("Failed to init GTK");
@@ -499,13 +598,14 @@ fn main() {
             draw_bar(cr, pad_h + bar_w + spacing, pad_v, bar_w, bar_h, seven_pct,
                      &format!("7d:{:.0}%", seven_pct), seven_time, font_size, s.scale);
 
-            // Stale indicator
+            // Stale indicator — red dot in top-right corner
             if s.usage.error.as_deref() == Some("stale") {
-                cr.set_source_rgba(1.0, 0.8, 0.0, 0.9);
-                cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
-                cr.set_font_size(font_size);
-                cr.move_to(alloc_w - 14.0 * s.scale, 13.0 * s.scale);
-                let _ = cr.show_text("!");
+                let dot_r = 3.5 * s.scale;
+                let dot_x = alloc_w - dot_r - 3.0 * s.scale;
+                let dot_y = dot_r + 3.0 * s.scale;
+                cr.arc(dot_x, dot_y, dot_r, 0.0, 2.0 * PI);
+                cr.set_source_rgba(COLOR_RED.0, COLOR_RED.1, COLOR_RED.2, 0.95);
+                let _ = cr.fill();
             }
 
             glib::Propagation::Stop
@@ -526,33 +626,113 @@ fn main() {
                 }
                 3 => {
                     // Right click — toggle popup
+                    let existing_popup = st.borrow_mut().popup.take();
+                    if let Some(popup) = existing_popup {
+                        unsafe { popup.destroy(); }
+                        return glib::Propagation::Stop;
+                    }
                     let mut s = st.borrow_mut();
-                    if let Some(ref popup) = s.popup {
-                        popup.close();
-                        s.popup = None;
-                    } else {
+                    {
                         let (win_x, win_y) = win_ref.position();
                         let alloc_h = win_ref.allocated_height();
                         let usage = s.usage.clone();
-                        let da_clone = da.clone();
-                        let st_clone = st.clone();
-                        let popup = create_popup(&usage, win_x, win_y, alloc_h, move || {
-                            // Refresh callback
-                            let new_usage = fetch_usage();
-                            let mut s = st_clone.borrow_mut();
-                            if new_usage.error.as_deref() == Some("network") {
-                                if let Some(ref good) = s.last_good {
-                                    s.usage = good.clone();
-                                    s.usage.error = Some("stale".into());
-                                }
-                            } else {
-                                if new_usage.error.is_none() {
+                        let poll_min = s.config.poll_minutes;
+
+                        let refresh_cb = {
+                            let st_clone = st.clone();
+                            let da_clone = da.clone();
+                            move || {
+                                let new_usage = fetch_usage();
+                                let mut s = st_clone.borrow_mut();
+                                if new_usage.error.is_some() {
+                                    if let Some(ref good) = s.last_good {
+                                        s.usage = good.clone();
+                                        s.usage.error = Some("stale".into());
+                                    } else {
+                                        s.usage = new_usage;
+                                    }
+                                } else {
                                     s.last_good = Some(new_usage.clone());
+                                    s.usage = new_usage;
                                 }
-                                s.usage = new_usage;
+                                da_clone.queue_draw();
                             }
-                            da_clone.queue_draw();
-                        });
+                        };
+
+                        let interval_cb = {
+                            let st_clone = st.clone();
+                            let da_clone = da.clone();
+                            let win_ref2 = win_ref.clone();
+                            move |delta: i32| {
+                                let new_min = {
+                                    let mut s = st_clone.borrow_mut();
+                                    let cur = s.config.poll_minutes as i32;
+                                    let new_val = (cur + delta)
+                                        .clamp(MIN_POLL_MINUTES as i32, MAX_POLL_MINUTES as i32)
+                                        as u32;
+                                    s.config.poll_minutes = new_val;
+                                    save_config(&s.config);
+                                    // Close popup
+                                    if let Some(popup) = s.popup.take() {
+                                        unsafe { popup.destroy(); }
+                                    }
+                                    new_val
+                                };
+                                start_timer(&st_clone, &da_clone);
+                                // Reopen popup so user can continue clicking
+                                let (wx, wy) = win_ref2.position();
+                                let ah = win_ref2.allocated_height();
+                                let usage = st_clone.borrow().usage.clone();
+                                let refresh_cb2 = {
+                                    let st2 = st_clone.clone();
+                                    let da2 = da_clone.clone();
+                                    move || {
+                                        let new_usage = fetch_usage();
+                                        let mut s = st2.borrow_mut();
+                                        if new_usage.error.is_some() {
+                                            if let Some(ref g) = s.last_good {
+                                                s.usage = g.clone();
+                                                s.usage.error = Some("stale".into());
+                                            } else {
+                                                s.usage = new_usage;
+                                            }
+                                        } else {
+                                            s.last_good = Some(new_usage.clone());
+                                            s.usage = new_usage;
+                                        }
+                                        da2.queue_draw();
+                                    }
+                                };
+                                let interval_cb2 = {
+                                    let st3 = st_clone.clone();
+                                    let da3 = da_clone.clone();
+                                    let win3 = win_ref2.clone();
+                                    move |d: i32| {
+                                        let new_val = {
+                                            let mut s = st3.borrow_mut();
+                                            let cur = s.config.poll_minutes as i32;
+                                            let nv = (cur + d).clamp(MIN_POLL_MINUTES as i32, MAX_POLL_MINUTES as i32) as u32;
+                                            s.config.poll_minutes = nv;
+                                            save_config(&s.config);
+                                            if let Some(p) = s.popup.take() { unsafe { p.destroy(); } }
+                                            nv
+                                        };
+                                        start_timer(&st3, &da3);
+                                        // Just close and let user reopen; avoid deep recursion
+                                        let _ = new_val;
+                                        let _ = win3;
+                                    }
+                                };
+                                let new_popup = create_popup(&usage, wx, wy, ah, new_min, refresh_cb2, interval_cb2);
+                                new_popup.connect_destroy({
+                                    let st4 = st_clone.clone();
+                                    move |_| { st4.borrow_mut().popup = None; }
+                                });
+                                st_clone.borrow_mut().popup = Some(new_popup);
+                            }
+                        };
+
+                        let popup = create_popup(&usage, win_x, win_y, alloc_h, poll_min, refresh_cb, interval_cb);
                         popup.connect_destroy({
                             let st2 = st.clone();
                             move |_| {
@@ -629,27 +809,7 @@ fn main() {
     }
 
     // ── Timer ──────────────────────────────────────────────────────────
-    {
-        let st = state.clone();
-        let da = drawing_area.clone();
-        glib::timeout_add_seconds_local(POLL_INTERVAL_SEC, move || {
-            let new_usage = fetch_usage();
-            let mut s = st.borrow_mut();
-            if new_usage.error.as_deref() == Some("network") {
-                if let Some(ref good) = s.last_good {
-                    s.usage = good.clone();
-                    s.usage.error = Some("stale".into());
-                }
-            } else {
-                if new_usage.error.is_none() {
-                    s.last_good = Some(new_usage.clone());
-                }
-                s.usage = new_usage;
-            }
-            da.queue_draw();
-            ControlFlow::Continue
-        });
-    }
+    start_timer(&state, &drawing_area);
 
     win.show_all();
     win.connect_destroy(|_| gtk::main_quit());

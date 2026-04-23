@@ -59,7 +59,7 @@ This is an undocumented endpoint used internally by Claude Code. It returns util
 }
 ```
 
-**Poll interval:** every 120 seconds (2 minutes). Token is re-read from disk on each request (Claude Code may refresh it externally).
+**Poll interval:** every 300 seconds (5 minutes). Token is re-read from disk on each request (Claude Code may refresh it externally).
 
 ## Target environment
 
