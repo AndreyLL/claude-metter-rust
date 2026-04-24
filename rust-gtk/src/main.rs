@@ -487,13 +487,7 @@ fn draw_rate_curve(
     cr.set_line_cap(cairo::LineCap::Round);
     cr.set_line_join(cairo::LineJoin::Round);
 
-    // Dark halo
-    cr.set_line_width((2.5 * scale).max(1.5));
-    cr.set_source_rgba(0.0, 0.0, 0.0, 0.6);
-    let _ = cr.stroke_preserve();
-
-    // Yellow line
-    cr.set_line_width((0.75 * scale).max(0.5));
+    cr.set_line_width((0.5 * scale).max(0.5));
     cr.set_source_rgba(COLOR_CURVE.0, COLOR_CURVE.1, COLOR_CURVE.2, 0.95);
     let _ = cr.stroke();
 }
