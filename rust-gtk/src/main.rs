@@ -919,7 +919,7 @@ fn main() {
                             let da_clone = da.clone();
                             let win_ref2 = win_ref.clone();
                             move |delta: i32| {
-                                let new_min = {
+                                let (new_min, old_popup) = {
                                     let mut s = st_clone.borrow_mut();
                                     let cur = s.config.poll_minutes as i32;
                                     let new_val = (cur + delta)
@@ -927,12 +927,13 @@ fn main() {
                                         as u32;
                                     s.config.poll_minutes = new_val;
                                     save_config(&s.config);
-                                    // Close popup
-                                    if let Some(popup) = s.popup.take() {
-                                        unsafe { popup.destroy(); }
-                                    }
-                                    new_val
+                                    (new_val, s.popup.take())
                                 };
+                                // Destroy OUTSIDE the borrow — destroy signal fires
+                                // connect_destroy synchronously, which re-borrows.
+                                if let Some(popup) = old_popup {
+                                    unsafe { popup.destroy(); }
+                                }
                                 start_timer(&st_clone, &da_clone);
                                 // Reopen popup so user can continue clicking
                                 let (wx, wy) = win_ref2.position();
@@ -964,15 +965,15 @@ fn main() {
                                     let da3 = da_clone.clone();
                                     let win3 = win_ref2.clone();
                                     move |d: i32| {
-                                        let new_val = {
+                                        let (new_val, old_popup) = {
                                             let mut s = st3.borrow_mut();
                                             let cur = s.config.poll_minutes as i32;
                                             let nv = (cur + d).clamp(MIN_POLL_MINUTES as i32, MAX_POLL_MINUTES as i32) as u32;
                                             s.config.poll_minutes = nv;
                                             save_config(&s.config);
-                                            if let Some(p) = s.popup.take() { unsafe { p.destroy(); } }
-                                            nv
+                                            (nv, s.popup.take())
                                         };
+                                        if let Some(p) = old_popup { unsafe { p.destroy(); } }
                                         start_timer(&st3, &da3);
                                         // Just close and let user reopen; avoid deep recursion
                                         let _ = new_val;
