@@ -36,7 +36,7 @@ Shows per-limit breakdown with reset times:
 
 - **Left-click drag** — reposition the widget
 - **Right click** — toggle popup with details
-- **Scroll wheel** — resize (scale 0.5x to 8.0x)
+- **Scroll wheel** — resize (scale 0.5x to 20.0x)
 
 ## Data source
 

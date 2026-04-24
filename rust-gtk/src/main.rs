@@ -1035,7 +1035,7 @@ fn main() {
         event_box.connect_scroll_event(move |_, event| {
             let mut s = st.borrow_mut();
             match event.direction() {
-                ScrollDirection::Up => s.scale = (s.scale + 0.15).min(8.0),
+                ScrollDirection::Up => s.scale = (s.scale + 0.15).min(20.0),
                 ScrollDirection::Down => s.scale = (s.scale - 0.15).max(0.5),
                 _ => return glib::Propagation::Proceed,
             }
