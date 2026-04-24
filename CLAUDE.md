@@ -15,12 +15,13 @@ Each bar has three layers:
 
 ### Burn-rate coloring
 
-The main bar color reflects projected usage at end of window, not just current percentage:
-- **Green** — projected <= 80% (plenty of room)
-- **Yellow** — projected 80–100% (tight, will barely fit)
-- **Red** — projected > 100% (will run out before window resets)
+The main bar color reflects projected usage at end of window as a continuous gradient:
+- **Green** — projected ≤ 80%
+- **Green → Yellow** — interpolated over 80–90%
+- **Yellow → Red** — interpolated over 90–100%
+- **Red** — projected ≥ 100%
 
-Formula: `projected = usage_pct / time_elapsed_pct * 100`
+Formula: `projected = usage_pct / time_elapsed_pct * 100`. Before the window has elapsed meaningfully, raw `usage_pct` is used as the driver instead.
 
 ### Popup details (left click)
 

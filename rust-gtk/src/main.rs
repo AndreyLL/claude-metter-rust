@@ -242,25 +242,31 @@ impl State {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
+fn lerp_rgb(a: (f64, f64, f64), b: (f64, f64, f64), t: f64) -> (f64, f64, f64) {
+    let t = t.clamp(0.0, 1.0);
+    (
+        a.0 + (b.0 - a.0) * t,
+        a.1 + (b.1 - a.1) * t,
+        a.2 + (b.2 - a.2) * t,
+    )
+}
+
 fn get_bar_color(usage_pct: f64, time_pct: Option<f64>) -> (f64, f64, f64) {
-    if let Some(tp) = time_pct {
-        if tp > 1.0 {
-            let projected = usage_pct / tp * 100.0;
-            return if projected <= 80.0 {
-                COLOR_GREEN
-            } else if projected <= 100.0 {
-                COLOR_YELLOW
-            } else {
-                COLOR_RED
-            };
-        }
-    }
-    if usage_pct <= 50.0 {
+    // Driver: projected usage when the window has elapsed enough; otherwise
+    // raw usage pct (at window start time_pct ≈ 0 and projection is noisy).
+    let driver = time_pct
+        .filter(|&tp| tp > 1.0)
+        .map(|tp| usage_pct / tp * 100.0)
+        .unwrap_or(usage_pct);
+
+    if driver <= 80.0 {
         COLOR_GREEN
-    } else if usage_pct <= 80.0 {
-        COLOR_YELLOW
-    } else {
+    } else if driver >= 100.0 {
         COLOR_RED
+    } else if driver <= 90.0 {
+        lerp_rgb(COLOR_GREEN, COLOR_YELLOW, (driver - 80.0) / 10.0)
+    } else {
+        lerp_rgb(COLOR_YELLOW, COLOR_RED, (driver - 90.0) / 10.0)
     }
 }
 
