@@ -41,6 +41,7 @@ const WINDOW_7D_SEC: f64 = 7.0 * 24.0 * 3600.0;
 
 const MIN_RATE_SCALE_5H: f64 = 2.0;  // %/hour autolevel floor
 const MIN_RATE_SCALE_7D: f64 = 0.2;
+const RATE_BIN_PX_7D: f64 = 5.0;  // 7d curve averaged into fixed-width bins
 
 // ── Data types ─────────────────────────────────────────────────────────────
 
@@ -399,6 +400,7 @@ fn draw_rate_curve(
     window_sec: f64,
     min_scale: f64,
     scale: f64,
+    bin_px: Option<f64>,
 ) {
     let Ok(reset) = DateTime::<FixedOffset>::parse_from_rfc3339(&buffer.resets_at) else {
         return;
@@ -436,20 +438,43 @@ fn draw_rate_curve(
 
     let max_rate = points.iter().map(|p| p.1).fold(min_scale, f64::max);
 
-    // Decimate if we have too many points per pixel; always keep the last point
-    // (freshest data — the tail the user most wants to see).
-    let target = ((2.0 * w).max(16.0)) as usize;
-    let step = (points.len() / target).max(1);
-    let drawn: Vec<(f64, f64)> = if step > 1 {
-        let mut d: Vec<(f64, f64)> = points.iter().step_by(step).copied().collect();
-        if let Some(&last) = points.last() {
-            if d.last() != Some(&last) {
-                d.push(last);
-            }
+    // Resampling strategy:
+    //   - bin_px = Some(px): fixed-pixel-width bins, rates averaged inside each
+    //     bin. Density grows with scale (more pixels → more bins → more detail).
+    //   - bin_px = None: keep raw points, decimate by step_by if too dense,
+    //     always preserving the last point.
+    let drawn: Vec<(f64, f64)> = if let Some(px) = bin_px {
+        let n_bins = ((w / px).round() as usize).max(2);
+        let mut bins: Vec<(f64, usize)> = vec![(0.0, 0); n_bins];
+        for &(t, r) in &points {
+            let idx = ((t * n_bins as f64) as usize).min(n_bins - 1);
+            bins[idx].0 += r;
+            bins[idx].1 += 1;
         }
-        d
+        bins.iter()
+            .enumerate()
+            .filter_map(|(i, &(sum, count))| {
+                if count == 0 {
+                    return None;
+                }
+                let center = (i as f64 + 0.5) / n_bins as f64;
+                Some((center, sum / count as f64))
+            })
+            .collect()
     } else {
-        points
+        let target = ((2.0 * w).max(16.0)) as usize;
+        let step = (points.len() / target).max(1);
+        if step > 1 {
+            let mut d: Vec<(f64, f64)> = points.iter().step_by(step).copied().collect();
+            if let Some(&last) = points.last() {
+                if d.last() != Some(&last) {
+                    d.push(last);
+                }
+            }
+            d
+        } else {
+            points
+        }
     };
     if drawn.len() < 2 {
         return;
@@ -506,6 +531,7 @@ fn draw_bar(
     rate_buffer: Option<&RateBuffer>,
     window_sec: f64,
     min_rate_scale: f64,
+    rate_bin_px: Option<f64>,
 ) {
     // Track background
     draw_rounded_rect(cr, x, y, w, h, 2.0);
@@ -534,7 +560,9 @@ fn draw_bar(
 
     // Burn-rate curve — yellow, over fill/time-bar, under text
     if let Some(buf) = rate_buffer {
-        draw_rate_curve(cr, x, y, w, h, buf, window_sec, min_rate_scale, scale);
+        draw_rate_curve(
+            cr, x, y, w, h, buf, window_sec, min_rate_scale, scale, rate_bin_px,
+        );
     }
 
     // Text shadow
@@ -812,10 +840,11 @@ fn main() {
 
             draw_bar(cr, pad_h, pad_v, bar_w, bar_h, five_pct,
                      &format!("5h:{:.0}%", five_pct), five_time, font_size, s.scale,
-                     s.history.rate_5h.as_ref(), WINDOW_5H_SEC, MIN_RATE_SCALE_5H);
+                     s.history.rate_5h.as_ref(), WINDOW_5H_SEC, MIN_RATE_SCALE_5H, None);
             draw_bar(cr, pad_h + bar_w + spacing, pad_v, bar_w, bar_h, seven_pct,
                      &format!("7d:{:.0}%", seven_pct), seven_time, font_size, s.scale,
-                     s.history.rate_7d.as_ref(), WINDOW_7D_SEC, MIN_RATE_SCALE_7D);
+                     s.history.rate_7d.as_ref(), WINDOW_7D_SEC, MIN_RATE_SCALE_7D,
+                     Some(RATE_BIN_PX_7D));
 
             // Stale indicator — red dot in top-right corner
             if s.usage.error.as_deref() == Some("stale") {
