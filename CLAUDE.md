@@ -38,6 +38,7 @@ Shows per-limit breakdown with reset times:
 - **Left-click drag** — reposition the widget
 - **Right click** — toggle popup with details
 - **Scroll wheel** — resize (scale 0.5x to 20.0x)
+- **Middle click** — cycle background: off → plasma → BL2 desert → BL2 psycho → BL2 zero (saved in `config.json` as `background`). BL2 modes play pre-pixelated GIF frames from `rust-gtk/assets/` (exactly what is shown: 100×24 per frame, drawn twice side by side, screen-door grid stretched with scale)
 
 ## Data source
 

@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::f64::consts::PI;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, FixedOffset, Utc};
 use gdk::prelude::*;
@@ -43,6 +44,29 @@ const MIN_RATE_SCALE_5H: f64 = 2.0;  // %/hour autolevel floor
 const MIN_RATE_SCALE_7D: f64 = 0.2;
 const RATE_BIN_PX_7D: f64 = 5.0;  // 7d curve averaged into fixed-width bins
 
+// Plasma background: computed on a tiny grid, upscaled bilinear — cost is scale-independent
+const PLASMA_W: i32 = 64;
+const PLASMA_H: i32 = 8;
+const PLASMA_SPEED: f64 = 1.2;
+const PLASMA_FPS: u64 = 30;
+
+// Borderlands 2 backgrounds: GIF frames pre-cropped and pre-pixelated to exactly what is shown,
+// raw BGRA (= cairo ARGB32 on little-endian). Drawn twice side by side, each copy ~4.2:1.
+// desert: https://i.makeagif.com/media/3-29-2015/LDBuRn.gif
+//   convert in.gif -coalesce -crop 320x76+0+52 +repage -scale 100x24! -modulate 95,140 -background black -alpha remove -alpha opaque -depth 8 bgra:bl2_desert_100x24.bgra
+// psycho: https://64.media.tumblr.com/ff517781cf1e606406bf9b9b41a3b5ce/tumblr_prvhamlYFc1ut1d6co3_540.gifv (every 2nd frame)
+//   convert in.gif -coalesce -delete $(seq -s, 1 2 39) -crop 540x128+0+86 +repage -scale 100x24! -modulate 95,140 -background black -alpha remove -alpha opaque -depth 8 bgra:bl2_psycho_100x24.bgra
+const BL2_DESERT: &[u8] = include_bytes!("../assets/bl2_desert_100x24.bgra");
+// zero: https://i.makeagif.com/media/9-22-2019/PSEoL5.gif (top strip)
+//   convert in.gif -coalesce -crop 480x114+0+0 +repage -scale 100x24! -modulate 95,140 -background black -alpha remove -alpha opaque -depth 8 bgra:bl2_zero_100x24.bgra
+const BL2_PSYCHO: &[u8] = include_bytes!("../assets/bl2_psycho_100x24.bgra");
+const BL2_ZERO: &[u8] = include_bytes!("../assets/bl2_zero_100x24.bgra");
+const BL2_W: i32 = 100;
+const BL2_H: i32 = 24;
+// Screen-door grid: one cell = GRID_CELL tile px, the last column/row is black.
+// Stretched together with the frame, so line thickness grows with scale (≈1px at ~7x).
+const GRID_CELL: i32 = 7;
+
 // ── Data types ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -84,14 +108,58 @@ struct UsageData {
     error: Option<String>,
 }
 
+#[derive(Deserialize, serde::Serialize, Clone, Copy, PartialEq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+enum Background {
+    Off,
+    #[default]
+    Plasma,
+    Desert,
+    Psycho,
+    Zero,
+}
+
+impl Background {
+    fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Plasma,
+            Self::Plasma => Self::Desert,
+            Self::Desert => Self::Psycho,
+            Self::Psycho => Self::Zero,
+            Self::Zero => Self::Off,
+        }
+    }
+
+    // Frames and per-frame duration for GIF modes
+    fn frames(self) -> Option<(&'static [u8], f64)> {
+        match self {
+            Self::Desert => Some((BL2_DESERT, 0.13)),
+            Self::Psycho => Some((BL2_PSYCHO, 0.06)),
+            Self::Zero => Some((BL2_ZERO, 0.2 / 3.0)),  // source delays 70/60/70 ms
+            _ => None,
+        }
+    }
+
+    // Redraw interval: GIF modes redraw only when the frame changes
+    fn tick(self) -> Option<Duration> {
+        match self {
+            Self::Off => None,
+            Self::Plasma => Some(Duration::from_millis(1000 / PLASMA_FPS)),
+            _ => self.frames().map(|(_, sec)| Duration::from_secs_f64(sec)),
+        }
+    }
+}
+
 #[derive(Deserialize, serde::Serialize, Clone, Debug)]
+#[serde(default)]
 struct Config {
     poll_minutes: u32,
+    background: Background,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { poll_minutes: DEFAULT_POLL_MINUTES }
+        Self { poll_minutes: DEFAULT_POLL_MINUTES, background: Background::default() }
     }
 }
 
@@ -208,6 +276,7 @@ struct State {
     popup: Option<gtk::Window>,
     config: Config,
     timer_source: Option<glib::SourceId>,
+    anim_source: Option<glib::SourceId>,
     history: History,
 }
 
@@ -221,6 +290,7 @@ impl State {
             popup: None,
             config: load_config(),
             timer_source: None,
+            anim_source: None,
             history: load_history(),
         }
     }
@@ -394,6 +464,110 @@ fn draw_rounded_rect(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64
     cr.arc(x + r, y + h - r, r, 0.5 * PI, PI);
     cr.arc(x + r, y + r, r, PI, 1.5 * PI);
     cr.close_path();
+}
+
+fn draw_plasma(cr: &cairo::Context, w: f64, h: f64, t: f64) {
+    let t = t * PLASMA_SPEED;
+    let stride = cairo::Format::ARgb32.stride_for_width(PLASMA_W as u32).unwrap();
+    let mut data = vec![0u8; (stride * PLASMA_H) as usize];
+    // Moving center for the radial ripple
+    let cx = 4.0 + 3.5 * (t * 0.37).sin();
+    let cy = 0.5 + (t * 0.5).cos();
+    for j in 0..PLASMA_H {
+        for i in 0..PLASMA_W {
+            // Grid units: ~square cells, x in 0..8, y in 0..1
+            let x = i as f64 / PLASMA_H as f64;
+            let y = j as f64 / PLASMA_H as f64;
+            let v = (x * 1.3 + t).sin()
+                + (y * 3.0 + t * 1.7).sin()
+                + (x * 0.8 + y * 2.0 + t * 0.9).sin()
+                + (((x - cx).powi(2) + (y - cy).powi(2)).sqrt() * 2.5 - t * 1.3).sin();
+            // v in -4..4 → neon rainbow, hue drifts over time
+            let ph = v * PI * 0.5 + t * 0.3;
+            let c = |off: f64| ((0.5 + 0.5 * (ph + off).sin()) * 255.0) as u32;
+            let px = 0xFF00_0000 | (c(0.0) << 16) | (c(2.1) << 8) | c(4.2);
+            let o = (j * stride + i * 4) as usize;
+            data[o..o + 4].copy_from_slice(&px.to_ne_bytes());
+        }
+    }
+    let surf = cairo::ImageSurface::create_for_data(
+        data, cairo::Format::ARgb32, PLASMA_W, PLASMA_H, stride,
+    ).unwrap();
+
+    cr.save().ok();
+    draw_rounded_rect(cr, 0.0, 0.0, w, h, CORNER_RADIUS);
+    cr.clip();
+    cr.scale(w / PLASMA_W as f64, h / PLASMA_H as f64);
+    let _ = cr.set_source_surface(&surf, 0.0, 0.0);
+    cr.source().set_filter(cairo::Filter::Bilinear);
+    cr.source().set_extend(cairo::Extend::Pad);
+    let _ = cr.paint_with_alpha(COLOR_BG_WINDOW.3);
+    cr.restore().ok();
+}
+
+// Grid for both halves rendered at widget size. Built once per size: the box-filtered
+// downscale is expensive at small scales, too slow to redo every frame.
+fn grid_surface(w: f64, h: f64) -> cairo::ImageSurface {
+    let out = cairo::ImageSurface::create(cairo::Format::ARgb32, w.ceil() as i32, h.ceil() as i32).unwrap();
+    let cr = cairo::Context::new(&out).unwrap();
+    // Grid tile, repeated: 1 cell of the frame = GRID_CELL tile px
+    let tile = cairo::ImageSurface::create(cairo::Format::ARgb32, GRID_CELL, GRID_CELL).unwrap();
+    {
+        let tc = cairo::Context::new(&tile).unwrap();
+        tc.set_source_rgb(0.0, 0.0, 0.0);
+        tc.rectangle((GRID_CELL - 1) as f64, 0.0, 1.0, GRID_CELL as f64);
+        tc.rectangle(0.0, (GRID_CELL - 1) as f64, GRID_CELL as f64, 1.0);
+        let _ = tc.fill();
+    }
+    tile.flush();
+    let grid = cairo::SurfacePattern::create(&tile);
+    grid.set_extend(cairo::Extend::Repeat);
+    // Good = box filter on downscale: at small scale the grid fades to even dimming, no moiré
+    grid.set_filter(cairo::Filter::Good);
+    let mut m = cairo::Matrix::identity();
+    m.scale(GRID_CELL as f64, GRID_CELL as f64);
+    grid.set_matrix(m);
+
+    let half = w / 2.0;
+    for k in 0..2 {
+        cr.save().ok();
+        cr.translate(k as f64 * half, 0.0);
+        cr.scale(half / BL2_W as f64, h / BL2_H as f64);
+        cr.rectangle(0.0, 0.0, BL2_W as f64, BL2_H as f64);
+        let _ = cr.set_source(&grid);
+        let _ = cr.fill();
+        cr.restore().ok();
+    }
+    drop(cr);
+    out
+}
+
+fn draw_frames(cr: &cairo::Context, w: f64, h: f64, frames: &[u8], frame: usize, grid: &cairo::ImageSurface) {
+    let size = (BL2_W * BL2_H * 4) as usize;
+    let f = frame % (frames.len() / size);
+    let surf = cairo::ImageSurface::create_for_data(
+        frames[f * size..(f + 1) * size].to_vec(),
+        cairo::Format::ARgb32, BL2_W, BL2_H, BL2_W * 4,
+    ).unwrap();
+
+    cr.save().ok();
+    draw_rounded_rect(cr, 0.0, 0.0, w, h, CORNER_RADIUS);
+    cr.clip();
+    // Two copies side by side, each in frame-cell units
+    let half = w / 2.0;
+    for k in 0..2 {
+        cr.save().ok();
+        cr.translate(k as f64 * half, 0.0);
+        cr.scale(half / BL2_W as f64, h / BL2_H as f64);
+        let _ = cr.set_source_surface(&surf, 0.0, 0.0);
+        cr.source().set_filter(cairo::Filter::Nearest);
+        cr.rectangle(0.0, 0.0, BL2_W as f64, BL2_H as f64);
+        let _ = cr.fill();
+        cr.restore().ok();
+    }
+    let _ = cr.set_source_surface(grid, 0.0, 0.0);
+    let _ = cr.paint();
+    cr.restore().ok();
 }
 
 fn draw_rate_curve(
@@ -694,7 +868,7 @@ fn create_popup(
 
     // Hint
     let hint = gtk::Label::new(None);
-    hint.set_markup("<span foreground='#999999' font='Sans 8'>LMB drag — move  |  Scroll — resize</span>");
+    hint.set_markup("<span foreground='#999999' font='Sans 8'>LMB drag — move  |  MMB — background  |  Scroll — resize</span>");
     hint.set_xalign(0.5);
     vbox.pack_start(&hint, false, false, 0);
 
@@ -749,6 +923,20 @@ fn start_timer(state: &Rc<RefCell<State>>, da: &gtk::DrawingArea) {
     state.borrow_mut().timer_source = Some(source);
 }
 
+fn start_anim(state: &Rc<RefCell<State>>, da: &gtk::DrawingArea) {
+    let mut s = state.borrow_mut();
+    if let Some(src) = s.anim_source.take() {
+        src.remove();
+    }
+    if let Some(tick) = s.config.background.tick() {
+        let da = da.clone();
+        s.anim_source = Some(glib::timeout_add_local(tick, move || {
+            da.queue_draw();
+            ControlFlow::Continue
+        }));
+    }
+}
+
 fn main() {
     gtk::init().expect("Failed to init GTK");
 
@@ -800,8 +988,10 @@ fn main() {
     win.move_(start_x, start_y);
 
     // ── Draw handler ───────────────────────────────────────────────────
+    let t0 = Instant::now();
     {
         let st = state.clone();
+        let grid_cache: RefCell<Option<cairo::ImageSurface>> = RefCell::new(None);
         drawing_area.connect_draw(move |_widget, cr| {
             let s = st.borrow();
             let (bar_w, bar_h, spacing, pad_h, pad_v, _tw, _th) = calc_size(s.scale);
@@ -815,9 +1005,24 @@ fn main() {
             cr.set_operator(cairo::Operator::Over);
 
             // Background
-            draw_rounded_rect(cr, 0.0, 0.0, alloc_w, alloc_h, CORNER_RADIUS);
-            cr.set_source_rgba(COLOR_BG_WINDOW.0, COLOR_BG_WINDOW.1, COLOR_BG_WINDOW.2, COLOR_BG_WINDOW.3);
-            let _ = cr.fill();
+            let t = t0.elapsed().as_secs_f64();
+            match s.config.background {
+                Background::Off => {
+                    draw_rounded_rect(cr, 0.0, 0.0, alloc_w, alloc_h, CORNER_RADIUS);
+                    cr.set_source_rgba(COLOR_BG_WINDOW.0, COLOR_BG_WINDOW.1, COLOR_BG_WINDOW.2, COLOR_BG_WINDOW.3);
+                    let _ = cr.fill();
+                }
+                Background::Plasma => draw_plasma(cr, alloc_w, alloc_h, t),
+                bg => {
+                    let (frames, sec) = bg.frames().unwrap();
+                    let mut grid = grid_cache.borrow_mut();
+                    let size = (alloc_w.ceil() as i32, alloc_h.ceil() as i32);
+                    if grid.as_ref().map(|g| (g.width(), g.height())) != Some(size) {
+                        *grid = Some(grid_surface(alloc_w, alloc_h));
+                    }
+                    draw_frames(cr, alloc_w, alloc_h, frames, (t / sec) as usize, grid.as_ref().unwrap());
+                }
+            }
 
             let font_size = (11.0 * s.scale).max(8.0);
 
@@ -866,6 +1071,9 @@ fn main() {
         });
     }
 
+    // ── Background animation ───────────────────────────────────────────
+    start_anim(&state, &drawing_area);
+
     // ── Button press ───────────────────────────────────────────────────
     {
         let st = state.clone();
@@ -878,6 +1086,16 @@ fn main() {
                     let (rx, ry) = event.root();
                     let (wx, wy) = win_ref.position();
                     st.borrow_mut().drag_start = Some((rx - wx as f64, ry - wy as f64));
+                }
+                2 => {
+                    // Middle click — cycle background
+                    {
+                        let mut s = st.borrow_mut();
+                        s.config.background = s.config.background.next();
+                        save_config(&s.config);
+                    }
+                    start_anim(&st, &da);
+                    da.queue_draw();
                 }
                 3 => {
                     // Right click — toggle popup

@@ -21,3 +21,4 @@ Autostart enabled by default. Disable: `sudo rm /etc/xdg/autostart/claude-usage-
 - **LMB drag** — move
 - **RMB** — popup with details
 - **Scroll** — resize
+- **MMB** — cycle background (off / plasma / BL2 desert / BL2 psycho / BL2 zero)
