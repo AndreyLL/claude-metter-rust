@@ -874,9 +874,10 @@ fn main() {
         event_box.connect_button_press_event(move |_, event| {
             match event.button() {
                 1 => {
-                    // Left click — start drag
-                    let mut s = st.borrow_mut();
-                    s.drag_start = Some(event.root());
+                    // Left click — start drag; remember pointer offset from window origin
+                    let (rx, ry) = event.root();
+                    let (wx, wy) = win_ref.position();
+                    st.borrow_mut().drag_start = Some((rx - wx as f64, ry - wy as f64));
                 }
                 3 => {
                     // Right click — toggle popup
@@ -1021,14 +1022,12 @@ fn main() {
         let st = state.clone();
         let win_ref = win.clone();
         event_box.connect_motion_notify_event(move |_, event| {
-            let mut s = st.borrow_mut();
-            if let Some((start_x, start_y)) = s.drag_start {
+            let s = st.borrow();
+            // Absolute positioning: position() lags behind move_(), so
+            // accumulating deltas onto it loses movement on fast drags.
+            if let Some((off_x, off_y)) = s.drag_start {
                 let (rx, ry) = event.root();
-                let dx = rx - start_x;
-                let dy = ry - start_y;
-                let (wx, wy) = win_ref.position();
-                win_ref.move_(wx + dx as i32, wy + dy as i32);
-                s.drag_start = Some((rx, ry));
+                win_ref.move_((rx - off_x).round() as i32, (ry - off_y).round() as i32);
             }
             glib::Propagation::Stop
         });
